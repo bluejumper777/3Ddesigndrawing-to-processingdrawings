@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D 孔标注工具</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", "PingFang SC", sans-serif; background: #f0f4f8; height: 100vh; overflow: hidden; }
+.header { background: #1e293b; color: #fff; padding: 10px 20px; display: flex; align-items: center; gap: 16px; height: 44px; }
+.header h1 { font-size: 16px; font-weight: 600; }
+.header .subtitle { font-size: 11px; color: #94a3b8; }
+.main { display: flex; height: calc(100vh - 44px); }
+
+#upload-overlay { position: fixed; inset: 0; background: rgba(241,245,249,0.98); z-index: 100; display: grid; place-items: center; }
+#upload-overlay.hidden { display: none; }
+.upload-card { background: #fff; border-radius: 16px; padding: 36px; box-shadow: 0 16px 48px rgba(0,0,0,0.08); max-width: 460px; width: 90%; text-align: center; }
+.upload-area { border: 2px dashed #cbd5e1; border-radius: 12px; padding: 32px 16px; cursor: pointer; transition: all 0.2s; margin: 16px 0; }
+.upload-area:hover { border-color: #3b82f6; background: #eff6ff; }
+input[type="file"] { display: none; }
+.btn { display: inline-flex; align-items: center; padding: 8px 20px; border-radius: 8px; border: none; background: #3b82f6; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; margin: 4px; }
+.btn:hover { background: #2563eb; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-sm { padding: 5px 12px; font-size: 12px; }
+.btn-outline { background: transparent; border: 1px solid #94a3b8; color: #475569; }
+.btn-green { background: #16a34a; }
+.btn-green:hover { background: #15803d; }
+
+.left-panel { width: 340px; min-width: 260px; border-right: 1px solid #e2e8f0; display: flex; flex-direction: column; background: #fff; }
+.panel-header { padding: 10px 14px; border-bottom: 1px solid #e2e8f0; font-size: 12px; font-weight: 600; color: #374151; display: flex; align-items: center; justify-content: space-between; }
+.tree-container { flex: 1; overflow-y: auto; padding: 4px; font-size: 12px; }
+.tree-node { user-select: none; }
+.tree-row { display: flex; align-items: center; padding: 3px 6px; margin: 1px 0; border-radius: 4px; cursor: pointer; transition: background 0.1s; }
+.tree-row:hover { background: #f1f5f9; }
+.tree-row.selected { background: #dbeafe; outline: 1px solid #93c5fd; }
+.tree-row .toggle { width: 14px; text-align: center; font-size: 9px; color: #64748b; cursor: pointer; flex-shrink: 0; }
+.tree-row .icon { margin: 0 3px; font-size: 11px; flex-shrink: 0; }
+.tree-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #1e293b; font-size: 11px; }
+.tree-row.is-std .name { color: #9ca3af; }
+.tree-row .badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; margin-left: 4px; flex-shrink: 0; cursor: pointer; }
+.badge-std { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+.badge-custom { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
+.badge-asm { background: #fef9c3; color: #854d0e; border: 1px solid #fde68a; }
+.badge-weld { background: #fed7aa; color: #9a3412; border: 1px solid #fb923c; }
+.badge:hover { opacity: 0.7; }
+.tree-children { margin-left: 14px; border-left: 1px dotted #e2e8f0; }
+.actions-bar { padding: 10px 14px; border-top: 1px solid #e2e8f0; }
+.actions-bar .info { font-size: 11px; color: #64748b; margin-bottom: 6px; }
+
+.right-panel { flex: 1; position: relative; background: #eaecef; }
+#viewer-3d { width: 100%; height: 100%; }
+#viewer-status { position: absolute; top: 10px; left: 10px; color: #475569; font-size: 11px; z-index: 5; background: rgba(255,255,255,0.85); padding: 4px 8px; border-radius: 4px; }
+#hover-info { position: absolute; bottom: 12px; left: 12px; background: rgba(30,41,59,0.92); color: #f1f5f9; padding: 6px 12px; border-radius: 6px; font-size: 12px; z-index: 5; display: none; }
+#result-panel { position: absolute; top: 10px; right: 10px; background: rgba(255,255,255,0.95); border-radius: 8px; padding: 12px; max-width: 320px; max-height: 50vh; overflow-y: auto; font-size: 12px; z-index: 5; display: none; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+#result-panel a { color: #2563eb; text-decoration: none; font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>3D 孔标注工具</h1>
+  <span class="subtitle">STEP 在线查看 · 装配结构 · 孔特征标注</span>
+</div>
+<div id="global-progress" style="display:none;position:fixed;top:44px;left:0;right:0;height:4px;background:#e2e8f0;z-index:200;">
+  <div id="global-progress-fill" style="height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);width:0%;transition:width 0.4s;"></div>
+</div>
+
+<div id="upload-overlay">
+  <div class="upload-card">
+    <h2 style="font-size:18px;margin-bottom:6px;">上传 STEP 装配体</h2>
+    <p style="color:#64748b;font-size:12px;">在线渲染3D模型，解析层级结构</p>
+    <div class="upload-area" id="drop-area" onclick="document.getElementById('file-input').click()">
+      <p style="font-size:28px;">📁</p>
+      <p style="margin-top:6px;color:#64748b;font-size:12px;">点击或拖放 .step / .stp 文件</p>
+    </div>
+    <input type="file" id="file-input" accept=".step,.stp,.STEP,.STP">
+    <button class="btn" id="upload-btn" disabled onclick="doUpload()">上传装配体</button>
+    <button class="btn btn-green" id="upload-single-btn" disabled onclick="doUploadSingle()">单零件标注</button>
+    <button class="btn btn-outline" id="restore-btn" style="display:none;" onclick="doRestore()">打开上次项目</button>
+    <div id="upload-status" style="margin-top:10px;color:#64748b;font-size:12px;min-height:18px;"></div>
+    <div id="upload-progress" style="display:none;margin-top:10px;background:#e2e8f0;border-radius:6px;height:8px;overflow:hidden;">
+      <div id="upload-progress-fill" style="height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);width:0%;transition:width 0.3s;"></div>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="left-panel">
+    <div class="panel-header">
+      <span id="panel-title">装配结构</span>
+      <button class="btn btn-sm btn-outline" onclick="doNewProject()">重新上传</button>
+    </div>
+    <div class="tree-container" id="tree-container"></div>
+    <div class="actions-bar" id="actions-bar" style="display:none;">
+      <div class="info" id="select-info"></div>
+      <div style="margin-bottom:6px;font-size:11px;">
+        <a href="#" onclick="selectAllParts();return false;" style="color:#2563eb;margin-right:10px;">全选</a>
+        <a href="#" onclick="deselectAllParts();return false;" style="color:#2563eb;">全不选</a>
+      </div>
+      <div id="progress-bar" style="display:none;margin-bottom:6px;background:#e2e8f0;border-radius:4px;height:6px;overflow:hidden;">
+        <div id="progress-fill" style="height:100%;background:#3b82f6;width:0%;transition:width 0.3s;"></div>
+      </div>
+      <div id="progress-text" style="display:none;font-size:10px;color:#64748b;margin-bottom:4px;"></div>
+      <button class="btn btn-sm btn-green" onclick="doConfirm()">对勾选项生成孔标注</button>
+    </div>
+  </div>
+  <div class="right-panel">
+    <canvas id="viewer-3d"></canvas>
+    <div id="viewer-status">等待加载...</div>
+    <div id="hover-info"></div>
+    <div id="result-panel"></div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ─── Config ──────────────────────────────────────────────────────────────
+const OCCT_PATH = '/static/occt/';
+const DEFAULT_COLOR = 0x6699bb;
+const HIGHLIGHT_COLOR = 0x44dd66;
+const EDGE_COLOR = 0x333333;
+
+// ─── State ───────────────────────────────────────────────────────────────
+let scene, camera, renderer, controls;
+let partMeshes = []; // [{mesh, name, index}]
+let sessionId = null;
+let treeData = null; // from backend (text-regex parsed, correct names)
+
+// ─── Three.js setup ──────────────────────────────────────────────────────
+function initViewer() {
+  const canvas = document.getElementById('viewer-3d');
+  const container = canvas.parentElement;
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xeaecef);
+  camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100000);
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: null };
+  controls.keys = { LEFT: 'ArrowRight', UP: 'ArrowDown', RIGHT: 'ArrowLeft', BOTTOM: 'ArrowUp' };
+  controls.keyPanSpeed = 25;
+  controls.listenToKeyEvents(window);
+  renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.7); dl.position.set(300,500,400); scene.add(dl);
+  const dl2 = new THREE.DirectionalLight(0x88aacc, 0.25); dl2.position.set(-200,-100,-300); scene.add(dl2);
+  animate();
+  window.addEventListener('resize', () => {
+    camera.aspect = container.clientWidth / container.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(container.clientWidth, container.clientHeight);
+  });
+  // Click to select
+  renderer.domElement.addEventListener('click', onViewerClick);
+}
+function animate() {
+  requestAnimationFrame(animate);
+  if (controls) controls.update();
+  if (renderer) renderer.render(scene, camera);
+}
+function onViewerClick(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  const mouse = new THREE.Vector2(
+    ((e.clientX - rect.left) / rect.width) * 2 - 1,
+    -((e.clientY - rect.top) / rect.height) * 2 + 1
+  );
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(partMeshes.map(p => p.mesh));
+  if (hits.length > 0) {
+    const pm = partMeshes.find(p => p.mesh === hits[0].object);
+    if (pm) {
+      highlightParts([pm.index]);
+      highlightTreeRow(pm.index);
+    }
+  }
+}
+initViewer();
+
+// ─── Highlight ───────────────────────────────────────────────────────────
+function highlightParts(indices) {
+  const idxSet = new Set(indices);
+  partMeshes.forEach((p, i) => {
+    if (idxSet.has(i)) {
+      p.mesh.material.color.setHex(HIGHLIGHT_COLOR);
+      p.mesh.material.opacity = 1.0; p.mesh.material.transparent = false;
+    } else {
+      p.mesh.material.color.setHex(DEFAULT_COLOR);
+      p.mesh.material.opacity = 0.15; p.mesh.material.transparent = true;
+    }
+  });
+  const names = indices.map(i => partMeshes[i]?.name).filter(Boolean);
+  document.getElementById('hover-info').style.display = 'block';
+  document.getElementById('hover-info').textContent = names.length > 3 ? names[0] + ' etc ' + names.length : names.join(', ');
+}
+function resetHighlight() {
+  partMeshes.forEach(p => { p.mesh.material.color.setHex(DEFAULT_COLOR); p.mesh.material.opacity = 1.0; p.mesh.material.transparent = false; });
+  document.getElementById('hover-info').style.display = 'none';
+}
+function highlightTreeRow(meshIdx) {
+  document.querySelectorAll('.tree-row.selected').forEach(r => r.classList.remove('selected'));
+  const meshName = partMeshes[meshIdx]?.name;
+  if (!meshName) return;
+  // Try exact match first
+  const allNames = document.querySelectorAll('.tree-row .name');
+  for (const nameEl of allNames) {
+    if (nameEl.textContent === meshName) {
+      const row = nameEl.closest('.tree-row');
+      row.classList.add('selected');
+      row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      return;
+    }
+  }
+  // Try partial match (mesh name contained in tree name or vice versa)
+  for (const nameEl of allNames) {
+    const treeName = nameEl.textContent;
+    if (treeName.includes(meshName) || meshName.includes(treeName)) {
+      const row = nameEl.closest('.tree-row');
+      row.classList.add('selected');
+      row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      return;
+    }
+  }
+}
+
+// ─── occt-import-js: load STEP in browser ────────────────────────────────
+let occtReady = null;
+function initOcct() {
+  if (occtReady) return occtReady;
+  occtReady = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = OCCT_PATH + 'occt-import-js.js';
+    s.onload = async () => {
+      try { const occt = await occtimportjs({ locateFile: f => OCCT_PATH + f }); resolve(occt); }
+      catch (e) { reject(e); }
+    };
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return occtReady;
+}
+
+async function loadStepBuffer(buffer) {
+  document.getElementById('viewer-status').textContent = '解析STEP(WASM)...';
+  const occt = await initOcct();
+  const result = occt.ReadStepFile(new Uint8Array(buffer), null);
+  document.getElementById('viewer-status').textContent = `渲染 ${result.meshes.length} 个零件...`;
+
+  const group = new THREE.Group();
+  partMeshes = [];
+  for (let i = 0; i < result.meshes.length; i++) {
+    const m = result.meshes[i];
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(m.attributes.position.array), 3));
+    if (m.attributes.normal) geo.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(m.attributes.normal.array), 3));
+    if (m.index) geo.setIndex(new THREE.BufferAttribute(new Uint32Array(m.index.array), 1));
+    geo.computeVertexNormals();
+
+    const mat = new THREE.MeshPhongMaterial({ color: DEFAULT_COLOR, specular: 0x222222, shininess: 20, side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geo, mat);
+    // Edges
+    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 30), new THREE.LineBasicMaterial({ color: EDGE_COLOR, opacity: 0.3, transparent: true }));
+    mesh.add(edges);
+    group.add(mesh);
+    partMeshes.push({ mesh, name: m.name || `Part_${i}`, index: i });
+  }
+
+  const box = new THREE.Box3().setFromObject(group);
+  const center = box.getCenter(new THREE.Vector3());
+  group.position.sub(center);
+  scene.add(group);
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+  camera.position.set(maxDim*1.2, maxDim*0.8, maxDim*1.4);
+  controls.target.set(0,0,0); controls.update();
+
+  document.getElementById('viewer-status').textContent = `${result.meshes.length} 个零件 · 左键旋转 · 右键平移 · 滚轮缩放 · 点击高亮`;
+
+  // Save mesh names list to backend for cache
+  const meshNames = partMeshes.map(p => p.name);
+  try {
+    const body = new FormData();
+    body.append('session_id', sessionId);
+    body.append('mesh_names', JSON.stringify(meshNames));
+    await fetch('/save-mesh-names', { method: 'POST', body });
+  } catch(e) {}
+}
+
+// ─── Tree rendering (from backend data, with mesh_id mapping by DFS order) ─
+function renderTree(nodes, container, parentIsWeldment = false) {
+  nodes.forEach(node => {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'tree-node';
+    const row = document.createElement('div');
+    row.className = 'tree-row';
+    const isChild = parentIsWeldment;
+    if (node.is_standard || isChild) row.classList.add('is-std');
+    if (node.mesh_id !== undefined) row.dataset.meshId = node.mesh_id;
+
+    // Toggle
+    const toggle = document.createElement('span'); toggle.className = 'toggle';
+    const hasChildren = node.type === 'assembly' && node.children && node.children.length > 0;
+    toggle.textContent = hasChildren ? '▾' : ' ';
+    row.appendChild(toggle);
+
+    // Checkbox for annotatable items
+    const isAnnotatable = !isChild && !node.is_standard && ((node.type === 'part') || (node.type === 'assembly' && node.is_weldment));
+    if (isAnnotatable) {
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = true;
+      cb.className = 'part-check'; cb.dataset.nodeName = node.name;
+      cb.style.cssText = 'margin-right:4px;width:13px;height:13px;cursor:pointer;flex-shrink:0;';
+      cb.addEventListener('click', e => e.stopPropagation());
+      row.appendChild(cb);
+    }
+
+    // Icon + Name
+    const icon = document.createElement('span'); icon.className = 'icon';
+    icon.textContent = isChild ? '🔗' : (node.is_weldment ? '🔗' : (node.type === 'assembly' ? '📂' : (node.is_standard ? '🔩' : '⚙️')));
+    row.appendChild(icon);
+    const nameEl = document.createElement('span'); nameEl.className = 'name';
+    nameEl.textContent = node.name; nameEl.title = node.name;
+    row.appendChild(nameEl);
+
+    // Badge
+    const badge = document.createElement('span'); badge.className = 'badge';
+    if (isChild) { badge.classList.add('badge-weld'); badge.textContent = '焊件'; badge.style.opacity = '0.6'; }
+    else if (node.is_standard) { badge.classList.add('badge-std'); badge.textContent = '标准件'; }
+    else if (node.is_weldment) { badge.classList.add('badge-weld'); badge.textContent = '焊件'; }
+    else if (node.type === 'assembly') { badge.classList.add('badge-asm'); badge.textContent = '装配体'; }
+    else { badge.classList.add('badge-custom'); badge.textContent = '非标件'; }
+    // Toggle standard on click
+    if (!isChild) {
+      badge.style.cursor = 'pointer';
+      badge.addEventListener('click', e => {
+        e.stopPropagation();
+        node.is_standard = !node.is_standard;
+        if (node.is_standard) node.is_weldment = false;
+        if (node.children) { const setAll = (ns,v) => { for(const n of ns){n.is_standard=v;n.is_weldment=false;if(n.children)setAll(n.children,v);} }; setAll(node.children, node.is_standard); }
+        rebuildTree(); saveTreeState();
+      });
+    }
+    row.appendChild(badge);
+
+    // Weldment button for assemblies
+    if (node.type === 'assembly' && !isChild) {
+      const wb = document.createElement('span'); wb.className = 'badge';
+      wb.textContent = node.is_weldment ? '✓焊件' : '焊件';
+      wb.style.cssText = node.is_weldment ? 'background:#fed7aa;color:#9a3412;border:1px solid #fb923c;cursor:pointer;' : 'background:#f8fafc;color:#64748b;border:1px solid #e2e8f0;cursor:pointer;';
+      if (node.is_standard) wb.style.opacity = '0.3';
+      wb.addEventListener('click', e => {
+        e.stopPropagation(); if (node.is_standard) return;
+        node.is_weldment = !node.is_weldment;
+        rebuildTree(); saveTreeState();
+      });
+      row.appendChild(wb);
+    }
+
+    wrapper.appendChild(row);
+
+    // Click row -> highlight in 3D (by name matching)
+    row.addEventListener('click', () => {
+      document.querySelectorAll('.tree-row.selected').forEach(r => r.classList.remove('selected'));
+      row.classList.add('selected');
+      const names = new Set();
+      function collectNames(n) { names.add(n.name); if (n.children) n.children.forEach(collectNames); }
+      collectNames(node);
+      const indices = partMeshes.filter(p => names.has(p.name)).map(p => p.index);
+      if (indices.length > 0) highlightParts(indices); else resetHighlight();
+    });
+    row.addEventListener('dblclick', () => resetHighlight());
+
+    // Children
+    if (hasChildren) {
+      const childBox = document.createElement('div'); childBox.className = 'tree-children';
+      renderTree(node.children, childBox, isChild || !!node.is_weldment);
+      wrapper.appendChild(childBox);
+      let collapsed = false;
+      toggle.addEventListener('click', e => { e.stopPropagation(); collapsed = !collapsed; childBox.style.display = collapsed ? 'none' : 'block'; toggle.textContent = collapsed ? '▸' : '▾'; });
+    }
+    container.appendChild(wrapper);
+  });
+}
+
+function collectMeshIds(node) {
+  const ids = [];
+  if (node.mesh_id !== undefined) ids.push(node.mesh_id);
+  if (node.children) node.children.forEach(c => ids.push(...collectMeshIds(c)));
+  return ids;
+}
+
+function rebuildTree() {
+  const el = document.getElementById('tree-container'); el.innerHTML = '';
+  renderTree(treeData, el);
+  updateCounts();
+}
+
+function countParts(nodes) {
+  let std=0, custom=0;
+  for (const n of nodes) { if (n.is_standard) std++; else if (n.type==='part') custom++; if (n.children) { const c=countParts(n.children); std+=c.std; custom+=c.custom; } }
+  return {std,custom};
+}
+function updateCounts() {
+  if (!treeData) return;
+  const c = countParts(treeData);
+  document.getElementById('select-info').textContent = `非标件 ${c.custom} · 标准件 ${c.std}（跳过）· 点标签切换`;
+}
+
+// ─── Assign mesh_id to tree leaves by DFS order ──────────────────────────
+function assignMeshIds(nodes, counter = {i: 0}) {
+  for (const n of nodes) {
+    if (n.type === 'part') { n.mesh_id = counter.i++; }
+    else if (n.children) { assignMeshIds(n.children, counter); }
+  }
+}
+
+// ─── Session ─────────────────────────────────────────────────────────────
+function loadSession(data) {
+  sessionId = data.session_id;
+  treeData = data.tree;
+  // Assign mesh_ids to tree leaves (DFS order = occt-import-js order)
+  assignMeshIds(treeData);
+  document.getElementById('upload-overlay').classList.add('hidden');
+  rebuildTree();
+  document.getElementById('actions-bar').style.display = 'block';
+}
+
+let saveTimeout = null;
+function saveTreeState() {
+  if (saveTimeout) clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(async () => {
+    if (!sessionId || !treeData) return;
+    const body = new FormData();
+    body.append('session_id', sessionId);
+    body.append('tree_json', JSON.stringify(treeData));
+    await fetch('/save-tree', { method: 'POST', body }).catch(()=>{});
+  }, 500);
+}
+
+// ─── Progress helpers ─────────────────────────────────────────────────────
+function showUploadProgress(pct) {
+  const bar = document.getElementById('upload-progress');
+  const fill = document.getElementById('upload-progress-fill');
+  bar.style.display = 'block'; fill.style.width = pct + '%';
+}
+function hideUploadProgress() {
+  document.getElementById('upload-progress').style.display = 'none';
+  document.getElementById('upload-progress-fill').style.width = '0%';
+}
+function showGlobalProgress(pct) {
+  const bar = document.getElementById('global-progress');
+  const fill = document.getElementById('global-progress-fill');
+  bar.style.display = 'block'; fill.style.width = pct + '%';
+}
+function hideGlobalProgress() {
+  document.getElementById('global-progress').style.display = 'none';
+  document.getElementById('global-progress-fill').style.width = '0%';
+}
+
+// ─── Page load: check if previous session exists (don't auto-restore) ────
+(async () => {
+  try {
+    const resp = await fetch('/session');
+    if (resp.ok) {
+      document.getElementById('restore-btn').style.display = 'inline-flex';
+    }
+  } catch(e) {}
+})();
+
+window.doRestore = async function() {
+  try {
+    document.getElementById('upload-status').textContent = '恢复上次项目...';
+    showUploadProgress(20);
+    const resp = await fetch('/session');
+    if (!resp.ok) { document.getElementById('upload-status').textContent = '没有可恢复的项目'; hideUploadProgress(); return; }
+    const data = await resp.json();
+    showUploadProgress(50);
+    loadSession(data);
+    document.getElementById('upload-status').textContent = '加载3D模型...';
+    showGlobalProgress(30);
+    const stepResp = await fetch(`/step-file/${data.session_id}`);
+    if (stepResp.ok) { await loadStepBuffer(await stepResp.arrayBuffer()); }
+    showGlobalProgress(100);
+    showUploadProgress(100);
+    setTimeout(() => { hideUploadProgress(); hideGlobalProgress(); }, 500);
+  } catch(e) { document.getElementById('upload-status').textContent = '❌ 恢复失败: '+e.message; hideUploadProgress(); hideGlobalProgress(); }
+};
+
+// ─── Upload ──────────────────────────────────────────────────────────────
+const fileInput = document.getElementById('file-input');
+const dropArea = document.getElementById('drop-area');
+const uploadBtn = document.getElementById('upload-btn');
+const uploadSingleBtn = document.getElementById('upload-single-btn');
+let selectedFile = null;
+fileInput.addEventListener('change', e => { selectedFile = e.target.files[0]; if(selectedFile){dropArea.innerHTML=`<p>✅ ${selectedFile.name}</p>`; uploadBtn.disabled=false; uploadSingleBtn.disabled=false;} });
+dropArea.addEventListener('dragover', e => e.preventDefault());
+dropArea.addEventListener('drop', e => { e.preventDefault(); const f=e.dataTransfer.files[0]; if(f){selectedFile=f; dropArea.innerHTML=`<p>✅ ${f.name}</p>`; uploadBtn.disabled=false; uploadSingleBtn.disabled=false;} });
+
+window.doUpload = async function() {
+  if (!selectedFile) return;
+  uploadBtn.disabled = true; uploadSingleBtn.disabled = true;
+  document.getElementById('upload-status').textContent = '上传并解析结构...';
+  showUploadProgress(20);
+  const body = new FormData(); body.append('file', selectedFile);
+  try {
+    const resp = await fetch('/upload', { method: 'POST', body });
+    showUploadProgress(60);
+    if (!resp.ok) throw new Error((await resp.json().catch(()=>({}))).detail || '失败');
+    const data = await resp.json();
+    showUploadProgress(80);
+    if (data.status === 'pending_confirmation') {
+      loadSession(data);
+      document.getElementById('upload-status').textContent = '渲染3D...';
+      showGlobalProgress(30);
+      await loadStepBuffer(await selectedFile.arrayBuffer());
+      showGlobalProgress(100);
+      setTimeout(hideGlobalProgress, 500);
+    } else if (data.status === 'completed') {
+      document.getElementById('upload-overlay').classList.add('hidden');
+      if (data.viewer_url) { document.getElementById('result-panel').style.display='block'; document.getElementById('result-panel').innerHTML=`<a href="${data.viewer_url}" target="_blank">打开标注</a>`; }
+    }
+    showUploadProgress(100);
+    setTimeout(hideUploadProgress, 500);
+  } catch(e) { document.getElementById('upload-status').textContent = '❌ '+e.message; uploadBtn.disabled=false; uploadSingleBtn.disabled=false; hideUploadProgress(); }
+};
+
+window.doUploadSingle = async function() {
+  if (!selectedFile) return;
+  uploadBtn.disabled = true; uploadSingleBtn.disabled = true;
+  document.getElementById('upload-status').textContent = '单零件标注分析中...';
+  showUploadProgress(20);
+  const body = new FormData(); body.append('file', selectedFile); body.append('mode', 'single');
+  try {
+    const resp = await fetch('/upload-single', { method: 'POST', body });
+    showUploadProgress(80);
+    if (!resp.ok) throw new Error((await resp.json().catch(()=>({}))).detail || '失败');
+    const data = await resp.json();
+    showUploadProgress(100);
+    if (data.total_holes === 0) {
+      document.getElementById('upload-status').textContent = '该零件没有识别到孔特征，无需标注。';
+      uploadBtn.disabled=false; uploadSingleBtn.disabled=false;
+    } else {
+      document.getElementById('upload-status').textContent = `✅ 识别到 ${data.total_holes} 个孔`;
+      document.getElementById('upload-overlay').classList.add('hidden');
+      const panel = document.getElementById('result-panel'); panel.style.display='block';
+      panel.innerHTML = `<div style="margin:3px 0"><a href="${data.viewer_url}" target="_blank">${selectedFile.name} (${data.total_holes}孔)</a></div>`;
+    }
+    setTimeout(hideUploadProgress, 500);
+  } catch(e) { document.getElementById('upload-status').textContent = '❌ '+e.message; uploadBtn.disabled=false; uploadSingleBtn.disabled=false; hideUploadProgress(); }
+};
+
+// ─── Confirm ─────────────────────────────────────────────────────────────
+window.doConfirm = async function() {
+  if (!sessionId) return;
+  const checks = document.querySelectorAll('.part-check:checked');
+  if (!checks.length) { document.getElementById('select-info').textContent = '⚠️ 请至少勾选一项'; return; }
+  const names = new Set(); checks.forEach(c => names.add(c.dataset.nodeName));
+  const parts = [];
+  function collect(nodes) { for(const n of nodes){ if(n.is_standard)continue; if(n.type==='assembly'&&n.is_weldment){if(names.has(n.name))parts.push({name:n.name,is_weldment:true});} else if(n.type==='assembly'){if(n.children)collect(n.children);} else{if(names.has(n.name))parts.push({name:n.name,is_weldment:false});} }}
+  collect(treeData);
+  document.getElementById('progress-bar').style.display='block';
+  document.getElementById('progress-fill').style.width='10%';
+  document.getElementById('select-info').textContent = '生成标注中...';
+  const formData = new FormData(); formData.append('session_id', sessionId); formData.append('parts_json', JSON.stringify(parts));
+  try {
+    const resp = await fetch('/confirm', { method:'POST', body: formData });
+    document.getElementById('progress-fill').style.width='100%';
+    if (!resp.ok) throw new Error('失败');
+    const data = await resp.json();
+    let statusText = `✅ ${data.total_parts} 件，${data.total_holes} 孔`;
+    if (data.errors && data.errors.length) {
+      statusText += ` · ⚠️ ${data.errors.length} 件匹配失败`;
+    }
+    document.getElementById('select-info').textContent = statusText;
+    const panel = document.getElementById('result-panel'); panel.style.display='block';
+    let html = '';
+    if (data.parts && data.parts.length) {
+      html += data.parts.map(p => `<div style="margin:3px 0"><a href="${p.viewer_url}" target="_blank">${p.name}</a> (${p.total_holes}孔)</div>`).join('');
+    }
+    if (data.errors && data.errors.length) {
+      html += '<div style="margin-top:8px;border-top:1px solid #e2e8f0;padding-top:6px;">';
+      html += data.errors.map(e => `<div style="margin:3px 0;color:#dc2626;font-size:11px;">❌ ${e.name}: ${e.error}</div>`).join('');
+      html += '</div>';
+    }
+    panel.innerHTML = html;
+    setTimeout(()=>{document.getElementById('progress-bar').style.display='none';},1500);
+  } catch(e) { document.getElementById('select-info').textContent='❌ '+e.message; document.getElementById('progress-bar').style.display='none'; }
+};
+
+window.selectAllParts = function() { document.querySelectorAll('.part-check').forEach(c=>c.checked=true); };
+window.deselectAllParts = function() { document.querySelectorAll('.part-check').forEach(c=>c.checked=false); };
+
+window.doNewProject = async function() {
+  try { await fetch('/clear-session', { method: 'POST' }); } catch(e) {}
+  location.reload();
+};
+
+</script>
+</body>
+</html>
