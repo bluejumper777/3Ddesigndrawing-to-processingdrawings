@@ -107,24 +107,15 @@ async def upload_step(file: UploadFile = File(...)):
     parts = split_assembly(str(step_path), str(session_dir))
 
     if not parts:
-        # Single part — process directly
-        result_data = analyze_step_and_generate_viewer(str(step_path), session_id, str(project_dir))
-        if result_data.get("error"):
-            raise HTTPException(status_code=500, detail=result_data["error"])
-        if result_data.get("total_holes", 0) == 0:
-            return {
-                "status": "completed",
-                "is_assembly": False,
-                "message": "该零件没有识别到孔特征，无需标注。",
-            }
-        return {
-            "status": "completed",
-            "is_assembly": False,
-            "total_holes": result_data["total_holes"],
-            "viewer_url": f"/output/{safe_project}/{session_id}/{Path(result_data['html_path']).name}",
-        }
+        # Single part — treat as a one-node tree (same flow as assembly)
+        parts = [{
+            "name": project_name,
+            "type": "part",
+            "pd_id": 0,
+            "solid_indices": [],
+        }]
 
-    # Assembly — return tree structure
+    # Assembly or single part — return tree structure
     flat_list = _flatten_tree(parts)
 
     # Mark standard parts in the tree
@@ -157,45 +148,6 @@ def _mark_standard_parts(nodes: list):
             node["is_standard"] = _is_standard_part(node.get("name", ""))
         if node.get("children"):
             _mark_standard_parts(node["children"])
-
-@app.post("/upload-single")
-async def upload_single_part(file: UploadFile = File(...)):
-    """Upload a single STEP part and directly generate hole annotations (no assembly tree)."""
-    original_name = file.filename or "model.step"
-    content = await file.read()
-
-    project_name = Path(original_name).stem
-    safe_project = "".join(c if c.isalnum() or c in "._- " else "_" for c in project_name).strip() or "part"
-
-    session_id = uuid4().hex[:8]
-    project_dir = OUTPUT_DIR / safe_project
-    project_dir.mkdir(parents=True, exist_ok=True)
-    session_dir = project_dir / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    step_path = session_dir / original_name
-    step_path.write_bytes(content)
-
-    # Directly analyze as single part
-    result_data = analyze_step_and_generate_viewer(str(step_path), session_id, str(project_dir))
-    if result_data.get("error"):
-        raise HTTPException(status_code=500, detail=result_data["error"])
-
-    total_holes = result_data.get("total_holes", 0)
-    viewer_url = None
-    if result_data.get("html_path"):
-        html_path = Path(result_data["html_path"])
-        try:
-            rel_path = html_path.resolve().relative_to(OUTPUT_DIR.resolve())
-        except ValueError:
-            rel_path = Path(html_path.parent.name) / html_path.name
-        viewer_url = f"/output/{rel_path.as_posix()}"
-
-    return {
-        "status": "completed",
-        "total_holes": total_holes,
-        "viewer_url": viewer_url,
-    }
-
 
 @app.post("/confirm")
 async def confirm_and_annotate(session_id: str = Form(...),

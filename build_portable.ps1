@@ -33,8 +33,9 @@ New-Item -ItemType Directory -Path $pythonDist -Force | Out-Null
 $basePython = & $venvPython -c "import sys; print(sys.base_prefix)"
 $pyVer = & $venvPython -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')"
 
-Copy-Item (Join-Path $venvPath "Scripts\python.exe") -Destination $pythonDist
-Copy-Item (Join-Path $venvPath "Scripts\pythonw.exe") -Destination $pythonDist -ErrorAction SilentlyContinue
+# Copy REAL python.exe from base installation (not venv shim!)
+Copy-Item (Join-Path $basePython "python.exe") -Destination $pythonDist
+Copy-Item (Join-Path $basePython "pythonw.exe") -Destination $pythonDist -ErrorAction SilentlyContinue
 
 # DLLs
 $dlls = @("python$pyVer.dll", "python3.dll", "vcruntime140.dll", "vcruntime140_1.dll")
@@ -64,7 +65,7 @@ robocopy $sitePackagesSrc $sitePackagesDst /E /NFL /NDL /NJH /NJS /NC /NS /NP /X
 Write-Host "  [OK] Site-packages" -ForegroundColor Green
 
 # _pth file
-$pthContent = "Lib`nLib\site-packages`n.`n..`nimport site"
+$pthContent = "Lib`nLib\site-packages`nDLLs`n.`n..`nimport site"
 Set-Content -Path (Join-Path $pythonDist "python${pyVer}._pth") -Value $pthContent -Encoding ASCII
 
 # Application files

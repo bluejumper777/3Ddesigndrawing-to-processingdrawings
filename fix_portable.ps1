@@ -1,0 +1,7 @@
+$distPython = "C:\HoleAnnotator_v5\python\python.exe"
+Write-Host "Testing imports..."
+& $distPython -c "import socket; print('socket OK')"
+& $distPython -c "import cadquery; print('CadQuery', cadquery.__version__)"
+& $distPython -c "import fastapi; print('FastAPI', fastapi.__version__)"
+& $distPython -c "import uvicorn; print('Uvicorn OK')"
+Write-Host "=== ALL TESTS DONE ==="

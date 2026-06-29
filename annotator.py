@@ -240,9 +240,19 @@ def split_assembly(step_file_path: str, output_dir: str) -> list[dict]:
         node = _build_node(root_pd, visited)
         tree.append(node)
 
-    # If single root assembly, return its children directly
+    # Keep the root assembly node so users can mark it as a weldment.
+    # Only strip it if it has sub-assemblies (multi-level), to avoid
+    # showing a redundant single root with the same name as the file.
+    # For flat assemblies (root → all parts), keep root as the weldment container.
     if len(tree) == 1 and tree[0]["type"] == "assembly" and tree[0].get("children"):
-        return tree[0]["children"]
+        children = tree[0]["children"]
+        # Check if any child is an assembly (multi-level)
+        has_sub_assemblies = any(c["type"] == "assembly" for c in children)
+        if has_sub_assemblies:
+            # Multi-level: strip root, show sub-assemblies at top
+            return children
+        # Flat assembly (all children are parts): keep root as container
+        # so user can mark it as weldment
 
     return tree
 
@@ -982,6 +992,7 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
     _MIN_TOTAL_ARC = _TWO_PI * 0.90  # 90% of full circle required
 
     raw_cyls = []
+    _hole_solid_shape = result.val().wrapped  # for inner/outer containment test
     for face in result.faces().vals():
         if face.geomType() != "CYLINDER":
             continue
@@ -996,6 +1007,38 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
         cyl = adaptor.Cylinder()
         radius = cyl.Radius()
         diameter = round(radius * 2, 2)
+
+        # === Inner/Outer face check (robust, orientation-independent) ===
+        # Sample a point on the cylinder surface, move it slightly TOWARD the axis.
+        # HOLE: that point enters the void → OUTSIDE solid.
+        # BOSS/PIN: that point enters material → INSIDE solid.
+        try:
+            from OCP.BRepClass3d import BRepClass3d_SolidClassifier as _SC
+            from OCP.TopAbs import TopAbs_IN as _IN
+            from OCP.gp import gp_Pnt as _gp_Pnt
+            um = (u_min + u_max) / 2
+            vm = (adaptor.FirstVParameter() + adaptor.LastVParameter()) / 2
+            sp = adaptor.Value(um, vm)  # point on cylinder surface
+            ap = cyl.Location()
+            adir = cyl.Axis().Direction()
+            spv = (sp.X()-ap.X(), sp.Y()-ap.Y(), sp.Z()-ap.Z())
+            along = spv[0]*adir.X() + spv[1]*adir.Y() + spv[2]*adir.Z()
+            ca = (ap.X()+adir.X()*along, ap.Y()+adir.Y()*along, ap.Z()+adir.Z()*along)
+            toward = (ca[0]-sp.X(), ca[1]-sp.Y(), ca[2]-sp.Z())
+            tlen = (toward[0]**2+toward[1]**2+toward[2]**2)**0.5
+            if tlen > 1e-9:
+                step = min(0.5, radius * 0.3)
+                tp = _gp_Pnt(
+                    sp.X() + toward[0]/tlen*step,
+                    sp.Y() + toward[1]/tlen*step,
+                    sp.Z() + toward[2]/tlen*step,
+                )
+                clf = _SC(_hole_solid_shape, tp, 1e-4)
+                if clf.State() == _IN:
+                    continue  # toward-axis is inside material → external cylinder
+        except Exception:
+            pass  # keep the face if check fails (conservative)
+
         face_center = face.Center()
         loc = cyl.Location()
         axis = cyl.Axis().Direction()
@@ -1028,40 +1071,75 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
             continue
         group_arc = c["arc_angle"]
         used[i] = True
-        # Find coaxial partners with same diameter
-        for j in range(i + 1, len(raw_cyls)):
-            if used[j]:
-                continue
-            other = raw_cyls[j]
-            if abs(c["diameter"] - other["diameter"]) > TOLERANCE:
-                continue
-            # Check coaxial: same axis_center (within tolerance)
-            ac1 = c["axis_center"]
-            ac2 = other["axis_center"]
-            ax1 = c["axis"]
-            ax2 = other["axis"]
-            # Axes must be parallel (dot product ≈ ±1)
-            dot = abs(ax1[0]*ax2[0] + ax1[1]*ax2[1] + ax1[2]*ax2[2])
-            if dot < 0.99:
-                continue
-            # Project axis_center difference onto perpendicular plane
-            diff = (ac1[0]-ac2[0], ac1[1]-ac2[1], ac1[2]-ac2[2])
-            along = diff[0]*ax1[0] + diff[1]*ax1[1] + diff[2]*ax1[2]
-            perp_sq = (diff[0] - along*ax1[0])**2 + (diff[1] - along*ax1[1])**2 + (diff[2] - along*ax1[2])**2
-            if perp_sq > 1.0:  # not coaxial
-                continue
-            group_arc += other["arc_angle"]
-            used[j] = True
+        ax1 = c["axis"]
+        ac1 = c["axis_center"]
+        # Collect all endpoints (top_pt, bot_pt) of this group to find full extent
+        group_pts = [c["top_pt"], c["bot_pt"]]
+
+        # Helper: project a point onto the axis (origin = ac1)
+        def _axproj(pt):
+            return (pt[0]-ac1[0])*ax1[0] + (pt[1]-ac1[1])*ax1[1] + (pt[2]-ac1[2])*ax1[2]
+
+        # Current group's axial range
+        grp_lo = min(_axproj(c["top_pt"]), _axproj(c["bot_pt"]))
+        grp_hi = max(_axproj(c["top_pt"]), _axproj(c["bot_pt"]))
+
+        # Find coaxial partners with same diameter (iterate until no more join,
+        # since group range can grow and admit adjacent faces)
+        changed = True
+        while changed:
+            changed = False
+            for j in range(len(raw_cyls)):
+                if used[j]:
+                    continue
+                other = raw_cyls[j]
+                if abs(c["diameter"] - other["diameter"]) > TOLERANCE:
+                    continue
+                ac2 = other["axis_center"]
+                ax2 = other["axis"]
+                # Axes must be parallel (dot product ≈ ±1)
+                dot = abs(ax1[0]*ax2[0] + ax1[1]*ax2[1] + ax1[2]*ax2[2])
+                if dot < 0.99:
+                    continue
+                # Perpendicular distance between the two axis lines must be ~0
+                diff = (ac1[0]-ac2[0], ac1[1]-ac2[1], ac1[2]-ac2[2])
+                along = diff[0]*ax1[0] + diff[1]*ax1[1] + diff[2]*ax1[2]
+                perp_sq = (diff[0] - along*ax1[0])**2 + (diff[1] - along*ax1[1])**2 + (diff[2] - along*ax1[2])**2
+                if perp_sq > 1.0:  # not coaxial
+                    continue
+                # ALONG-AXIS adjacency: the face's axial range must overlap or be
+                # within a small gap of the group's range. This prevents merging
+                # two distinct collinear holes (e.g. holes on opposite walls far apart).
+                o_lo = min(_axproj(other["top_pt"]), _axproj(other["bot_pt"]))
+                o_hi = max(_axproj(other["top_pt"]), _axproj(other["bot_pt"]))
+                gap = max(grp_lo - o_hi, o_lo - grp_hi, 0.0)
+                if gap > 3.0:  # too far apart along axis → different hole
+                    continue
+                group_arc += other["arc_angle"]
+                group_pts.append(other["top_pt"])
+                group_pts.append(other["bot_pt"])
+                grp_lo = min(grp_lo, o_lo)
+                grp_hi = max(grp_hi, o_hi)
+                used[j] = True
+                changed = True
         # Only keep if total arc coverage ≥ 90% of full circle
         if group_arc >= _MIN_TOTAL_ARC:
+            # Compute full axial extent: project all endpoints onto axis,
+            # pick the two extremes as the real outer/inner openings.
+            ref = group_pts[0]
+            def _proj(pt):
+                return (pt[0]-ref[0])*ax1[0] + (pt[1]-ref[1])*ax1[1] + (pt[2]-ref[2])*ax1[2]
+            pt_min = min(group_pts, key=_proj)
+            pt_max = max(group_pts, key=_proj)
+            full_depth = abs(_proj(pt_max) - _proj(pt_min))
             cylinders.append({
                 "diameter": c["diameter"],
                 "center": c["center"],
                 "axis_center": c["axis_center"],
                 "axis": c["axis"],
-                "top_pt": c["top_pt"],
-                "bot_pt": c["bot_pt"],
-                "depth": c["depth"],
+                "top_pt": pt_max,
+                "bot_pt": pt_min,
+                "depth": round(full_depth, 2) if full_depth > 0 else c["depth"],
             })
 
     try:
@@ -1071,6 +1149,26 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
         max_body_dim = 10000.0
 
     holes = [c for c in cylinders if c["diameter"] < max_body_dim * 0.9]
+
+    # Filter out tube cavities: depth/diameter ratio > 8 is unlikely a machined hole
+    # (typical max for drilled holes is ~5-6, gun drills go up to ~8)
+    # Also filter: absolute depth > 80mm for non-through holes with standard pin diameters
+    # (pin holes are rarely deeper than 3-4x diameter)
+    def _is_likely_hole(h):
+        depth = h.get("depth", 0)
+        dia = h["diameter"]
+        if depth <= 0 or dia <= 0:
+            return True
+        ratio = depth / dia
+        if ratio >= 8.0:
+            return False
+        # Additional check: pin-diameter holes (H7) deeper than 5x diameter are suspicious
+        if dia in (3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0):
+            if ratio > 5.0 and depth > 60.0:
+                return False
+        return True
+
+    holes = [h for h in holes if _is_likely_hole(h)]
 
     # Deduplication
     unique_holes = []
@@ -1219,43 +1317,22 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
             spec_text += f"\n\u6c89\u5b54\u03a6{counterbore['diameter']} \u6df1{cb_depth:.1f}"
         # Use surface point — for through holes pick the unobstructed side
         def _pick_surface_pt(h, is_thru):
+            """Pick the OUTER opening of the hole.
+            The outer opening is the end point farthest from the bbox center
+            (external surfaces lie on the part's outer envelope).
+            """
             top = h.get("top_pt", h["center"])
             bot = h.get("bot_pt", h["center"])
-            if is_thru:
-                # Check which end has no obstruction 10mm outside
-                ax = h["axis"]
-                try:
-                    # Test 10mm beyond top_pt
-                    pt_top_out = gp_Pnt(
-                        top[0] + ax[0] * 10.0,
-                        top[1] + ax[1] * 10.0,
-                        top[2] + ax[2] * 10.0,
-                    )
-                    cl_top = BRepClass3d_SolidClassifier(_solid_shape, pt_top_out, 0.01)
-                    top_free = cl_top.State() != TopAbs_IN if hasattr(cl_top, 'State') else True
-                    # Test 10mm beyond bot_pt (opposite direction)
-                    pt_bot_out = gp_Pnt(
-                        bot[0] - ax[0] * 10.0,
-                        bot[1] - ax[1] * 10.0,
-                        bot[2] - ax[2] * 10.0,
-                    )
-                    cl_bot = BRepClass3d_SolidClassifier(_solid_shape, pt_bot_out, 0.01)
-                    bot_free = cl_bot.State() != TopAbs_IN if hasattr(cl_bot, 'State') else True
-                    # Prefer the free (unobstructed) side
-                    if top_free and not bot_free:
-                        return top
-                    if bot_free and not top_free:
-                        return bot
-                except Exception:
-                    pass
-            # Fallback: pick the one farther from bounding box center
             try:
-                bc = ((bbox.xmin+bbox.xmax)/2, (bbox.ymin+bbox.ymax)/2, (bbox.zmin+bbox.zmax)/2)
+                bx = result.val().BoundingBox()
+                bcx = (bx.xmin + bx.xmax) / 2
+                bcy = (bx.ymin + bx.ymax) / 2
+                bcz = (bx.zmin + bx.zmax) / 2
+                d_top = (top[0]-bcx)**2 + (top[1]-bcy)**2 + (top[2]-bcz)**2
+                d_bot = (bot[0]-bcx)**2 + (bot[1]-bcy)**2 + (bot[2]-bcz)**2
+                return top if d_top >= d_bot else bot
             except Exception:
                 return top
-            d_top = (top[0]-bc[0])**2 + (top[1]-bc[1])**2 + (top[2]-bc[2])**2
-            d_bot = (bot[0]-bc[0])**2 + (bot[1]-bc[1])**2 + (bot[2]-bc[2])**2
-            return top if d_top >= d_bot else bot
         src_hole = counterbore if counterbore else hole
         ann_point = list(_pick_surface_pt(src_hole, is_through))
         annotations.append({
@@ -1294,7 +1371,10 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
 
 
 def _generate_viewer_html(stl_file_path, annotations, title, info, output_dir, session_id):
-    """Generate a standalone HTML file with 3D viewer and annotations."""
+    """Generate a standalone HTML file with 3D viewer and annotations.
+    
+    Inlines three.js libraries as base64 data URIs so the HTML works offline.
+    """
     stl_path = Path(stl_file_path)
     if not stl_path.exists():
         return None
@@ -1302,7 +1382,25 @@ def _generate_viewer_html(stl_file_path, annotations, title, info, output_dir, s
     stl_b64 = base64.b64encode(stl_data).decode("ascii")
     annotations_json = json.dumps(annotations, ensure_ascii=False)
     info_json = json.dumps(info or {}, ensure_ascii=False)
-    html = _build_viewer_html(stl_b64, annotations_json, info_json, title)
+
+    # Read three.js libraries and encode as base64 data URIs for importmap
+    static_dir = Path(__file__).parent / "static" / "three"
+    three_b64 = ""
+    orbit_b64 = ""
+    stl_loader_b64 = ""
+    if static_dir.exists():
+        three_file = static_dir / "three.module.js"
+        orbit_file = static_dir / "OrbitControls.js"
+        stl_loader_file = static_dir / "STLLoader.js"
+        if three_file.exists():
+            three_b64 = base64.b64encode(three_file.read_bytes()).decode("ascii")
+        if orbit_file.exists():
+            orbit_b64 = base64.b64encode(orbit_file.read_bytes()).decode("ascii")
+        if stl_loader_file.exists():
+            stl_loader_b64 = base64.b64encode(stl_loader_file.read_bytes()).decode("ascii")
+
+    html = _build_viewer_html(stl_b64, annotations_json, info_json, title,
+                              three_b64, orbit_b64, stl_loader_b64)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     output_name = f"{stl_path.stem}.html"
@@ -1311,12 +1409,31 @@ def _generate_viewer_html(stl_file_path, annotations, title, info, output_dir, s
     return str(output_path)
 
 
-def _build_viewer_html(stl_b64: str, annotations_json: str, info_json: str, title: str) -> str:
+def _build_viewer_html(stl_b64: str, annotations_json: str, info_json: str, title: str,
+                       three_b64: str = "", orbit_b64: str = "", stl_loader_b64: str = "") -> str:
     """Build the complete HTML string for the 3D annotated viewer.
 
+    Embeds three.js as base64 data URIs for fully offline operation.
     Right panel items are clickable: clicking a group shows only that group's
     annotations (first as full label, rest as colored dots). Click again to show all.
     """
+    # Build importmap with data URIs (works with file:// protocol)
+    if three_b64 and orbit_b64 and stl_loader_b64:
+        importmap_block = f'''<script type="importmap">{{
+  "imports": {{
+    "three": "data:text/javascript;base64,{three_b64}",
+    "three/addons/OrbitControls.js": "data:text/javascript;base64,{orbit_b64}",
+    "three/addons/STLLoader.js": "data:text/javascript;base64,{stl_loader_b64}"
+  }}
+}}</script>'''
+    else:
+        importmap_block = '''<script type="importmap">{
+  "imports": {
+    "three": "/static/three/three.module.js",
+    "three/addons/": "/static/three/"
+  }
+}</script>'''
+
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1388,16 +1505,11 @@ body {{ font-family: "Segoe UI", "PingFang SC", sans-serif; background: #c8ccd0;
 <div id="controls">鼠标左键旋转 · 右键平移 · 滚轮缩放 · 拖动标注调整位置 · 双击标注修改内容</div>
 <button id="save-btn" onclick="saveLayout()" style="position:fixed;bottom:16px;right:16px;background:rgba(26,95,204,0.9);color:#fff;border:none;border-radius:999px;padding:10px 20px;font-size:12px;font-weight:600;cursor:pointer;z-index:10;box-shadow:0 2px 8px rgba(0,0,0,0.15);">保存标注布局</button>
 <svg id="leader-svg" xmlns="http://www.w3.org/2000/svg" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:4;"></svg>
-<script type="importmap">{{
-  "imports": {{
-    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
-  }}
-}}</script>
+{importmap_block}
 <script type="module">
 import * as THREE from 'three';
-import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
-import {{ STLLoader }} from 'three/addons/loaders/STLLoader.js';
+import {{ OrbitControls }} from 'three/addons/OrbitControls.js';
+import {{ STLLoader }} from 'three/addons/STLLoader.js';
 const annotations = {annotations_json};
 const info = {info_json};
 const infoFields = document.getElementById('info-fields');

@@ -66,15 +66,14 @@ input[type="file"] { display: none; }
 
 <div id="upload-overlay">
   <div class="upload-card">
-    <h2 style="font-size:18px;margin-bottom:6px;">上传 STEP 装配体</h2>
-    <p style="color:#64748b;font-size:12px;">在线渲染3D模型，解析层级结构</p>
+    <h2 style="font-size:18px;margin-bottom:6px;">上传 STEP 文件</h2>
+    <p style="color:#64748b;font-size:12px;">支持装配体和单零件，在线渲染3D模型并识别孔特征</p>
     <div class="upload-area" id="drop-area" onclick="document.getElementById('file-input').click()">
       <p style="font-size:28px;">📁</p>
       <p style="margin-top:6px;color:#64748b;font-size:12px;">点击或拖放 .step / .stp 文件</p>
     </div>
     <input type="file" id="file-input" accept=".step,.stp,.STEP,.STP">
-    <button class="btn" id="upload-btn" disabled onclick="doUpload()">上传装配体</button>
-    <button class="btn btn-green" id="upload-single-btn" disabled onclick="doUploadSingle()">单零件标注</button>
+    <button class="btn" id="upload-btn" disabled onclick="doUpload()">上传并解析</button>
     <button class="btn btn-outline" id="restore-btn" style="display:none;" onclick="doRestore()">打开上次项目</button>
     <div id="upload-status" style="margin-top:10px;color:#64748b;font-size:12px;min-height:18px;"></div>
     <div id="upload-progress" style="display:none;margin-top:10px;background:#e2e8f0;border-radius:6px;height:8px;overflow:hidden;">
@@ -114,15 +113,15 @@ input[type="file"] { display: none; }
 <script type="importmap">
 {
   "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    "three": "/static/three/three.module.js",
+    "three/addons/": "/static/three/"
   }
 }
 </script>
 
 <script type="module">
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { OrbitControls } from 'three/addons/OrbitControls.js';
 
 // ─── Config ──────────────────────────────────────────────────────────────
 const OCCT_PATH = '/static/occt/';
@@ -502,15 +501,14 @@ window.doRestore = async function() {
 const fileInput = document.getElementById('file-input');
 const dropArea = document.getElementById('drop-area');
 const uploadBtn = document.getElementById('upload-btn');
-const uploadSingleBtn = document.getElementById('upload-single-btn');
 let selectedFile = null;
-fileInput.addEventListener('change', e => { selectedFile = e.target.files[0]; if(selectedFile){dropArea.innerHTML=`<p>✅ ${selectedFile.name}</p>`; uploadBtn.disabled=false; uploadSingleBtn.disabled=false;} });
+fileInput.addEventListener('change', e => { selectedFile = e.target.files[0]; if(selectedFile){dropArea.innerHTML=`<p>✅ ${selectedFile.name}</p>`; uploadBtn.disabled=false;} });
 dropArea.addEventListener('dragover', e => e.preventDefault());
-dropArea.addEventListener('drop', e => { e.preventDefault(); const f=e.dataTransfer.files[0]; if(f){selectedFile=f; dropArea.innerHTML=`<p>✅ ${f.name}</p>`; uploadBtn.disabled=false; uploadSingleBtn.disabled=false;} });
+dropArea.addEventListener('drop', e => { e.preventDefault(); const f=e.dataTransfer.files[0]; if(f){selectedFile=f; dropArea.innerHTML=`<p>✅ ${f.name}</p>`; uploadBtn.disabled=false;} });
 
 window.doUpload = async function() {
   if (!selectedFile) return;
-  uploadBtn.disabled = true; uploadSingleBtn.disabled = true;
+  uploadBtn.disabled = true;
   document.getElementById('upload-status').textContent = '上传并解析结构...';
   showUploadProgress(20);
   const body = new FormData(); body.append('file', selectedFile);
@@ -527,38 +525,10 @@ window.doUpload = async function() {
       await loadStepBuffer(await selectedFile.arrayBuffer());
       showGlobalProgress(100);
       setTimeout(hideGlobalProgress, 500);
-    } else if (data.status === 'completed') {
-      document.getElementById('upload-overlay').classList.add('hidden');
-      if (data.viewer_url) { document.getElementById('result-panel').style.display='block'; document.getElementById('result-panel').innerHTML=`<a href="${data.viewer_url}" target="_blank">打开标注</a>`; }
     }
     showUploadProgress(100);
     setTimeout(hideUploadProgress, 500);
-  } catch(e) { document.getElementById('upload-status').textContent = '❌ '+e.message; uploadBtn.disabled=false; uploadSingleBtn.disabled=false; hideUploadProgress(); }
-};
-
-window.doUploadSingle = async function() {
-  if (!selectedFile) return;
-  uploadBtn.disabled = true; uploadSingleBtn.disabled = true;
-  document.getElementById('upload-status').textContent = '单零件标注分析中...';
-  showUploadProgress(20);
-  const body = new FormData(); body.append('file', selectedFile); body.append('mode', 'single');
-  try {
-    const resp = await fetch('/upload-single', { method: 'POST', body });
-    showUploadProgress(80);
-    if (!resp.ok) throw new Error((await resp.json().catch(()=>({}))).detail || '失败');
-    const data = await resp.json();
-    showUploadProgress(100);
-    if (data.total_holes === 0) {
-      document.getElementById('upload-status').textContent = '该零件没有识别到孔特征，无需标注。';
-      uploadBtn.disabled=false; uploadSingleBtn.disabled=false;
-    } else {
-      document.getElementById('upload-status').textContent = `✅ 识别到 ${data.total_holes} 个孔`;
-      document.getElementById('upload-overlay').classList.add('hidden');
-      const panel = document.getElementById('result-panel'); panel.style.display='block';
-      panel.innerHTML = `<div style="margin:3px 0"><a href="${data.viewer_url}" target="_blank">${selectedFile.name} (${data.total_holes}孔)</a></div>`;
-    }
-    setTimeout(hideUploadProgress, 500);
-  } catch(e) { document.getElementById('upload-status').textContent = '❌ '+e.message; uploadBtn.disabled=false; uploadSingleBtn.disabled=false; hideUploadProgress(); }
+  } catch(e) { document.getElementById('upload-status').textContent = '❌ '+e.message; uploadBtn.disabled=false; hideUploadProgress(); }
 };
 
 // ─── Confirm ─────────────────────────────────────────────────────────────
