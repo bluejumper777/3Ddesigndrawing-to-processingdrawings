@@ -1150,11 +1150,87 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
 
     holes = [c for c in cylinders if c["diameter"] < max_body_dim * 0.9]
 
-    # Filter out tube cavities: depth/diameter ratio > 8 is unlikely a machined hole
-    # (typical max for drilled holes is ~5-6, gun drills go up to ~8)
-    # Also filter: absolute depth > 80mm for non-through holes with standard pin diameters
-    # (pin holes are rarely deeper than 3-4x diameter)
+    # === Through-hole detection (topology-based) ===
+    # A hole is "through" only when the hole's centerline stays in open space
+    # (void) for the entire span of the body along the hole axis. If solid
+    # material is found anywhere along the interior of that centerline, the
+    # hole is blind. Marching the full centerline is robust to drill-tip cones
+    # and stepped/counterbored bores, unlike a tiny nudge past the face end.
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.gp import gp_Pnt
+    from OCP.TopAbs import TopAbs_ON, TopAbs_OUT, TopAbs_IN
+    _solid_shape = result.val().wrapped
+    _bb = result.val().BoundingBox()
+    _corners = [
+        (_bb.xmin, _bb.ymin, _bb.zmin), (_bb.xmin, _bb.ymin, _bb.zmax),
+        (_bb.xmin, _bb.ymax, _bb.zmin), (_bb.xmin, _bb.ymax, _bb.zmax),
+        (_bb.xmax, _bb.ymin, _bb.zmin), (_bb.xmax, _bb.ymin, _bb.zmax),
+        (_bb.xmax, _bb.ymax, _bb.zmin), (_bb.xmax, _bb.ymax, _bb.zmax),
+    ]
+
+    def _is_through_hole_topo(hole_data):
+        """True only if no solid material blocks the bore beyond its ends.
+
+        The hole's own cylindrical span is void by definition, so it is skipped
+        entirely. Only the centerline OUTSIDE the hole's axial extent is sampled
+        (out to the body bounds). For a through hole both ends sit on outer
+        surfaces, so the outward regions are exterior and no material is found.
+        For a blind hole the closed end is inside the body, so material is hit
+        almost immediately (early exit). This keeps the query count proportional
+        to the small gap between the hole ends and the body surface, instead of
+        the full body length — much faster, especially for long through holes.
+        """
+        axis = hole_data["axis"]
+        ac = hole_data.get("axis_center", hole_data["center"])
+        top = hole_data.get("top_pt", hole_data["center"])
+        bot = hole_data.get("bot_pt", hole_data["center"])
+        depth = hole_data.get("depth", 0)
+        if depth < 0.5:
+            return False
+        try:
+            ax = (axis[0], axis[1], axis[2])
+
+            def _proj(p):
+                return (p[0] - ac[0]) * ax[0] + (p[1] - ac[1]) * ax[1] + (p[2] - ac[2]) * ax[2]
+
+            corner_projs = [_proj(c) for c in _corners]
+            amin, amax = min(corner_projs), max(corner_projs)
+            h_lo = min(_proj(top), _proj(bot))
+            h_hi = max(_proj(top), _proj(bot))
+            step = 0.5
+
+            def _has_material(t_start, t_end, direction):
+                """Scan (t_start → t_end) along the axis; True if any point is IN solid."""
+                t = t_start
+                while (direction > 0 and t < t_end) or (direction < 0 and t > t_end):
+                    px = ac[0] + ax[0] * t
+                    py = ac[1] + ax[1] * t
+                    pz = ac[2] + ax[2] * t
+                    st = BRepClass3d_SolidClassifier(_solid_shape, gp_Pnt(px, py, pz), 1e-4).State()
+                    if st == TopAbs_IN:
+                        return True
+                    t += direction * step
+                return False
+
+            # Only sample the two regions beyond the hole ends, up to body bounds.
+            if _has_material(h_hi + 0.3, amax - 0.3, +1):
+                return False  # material past the high end → blind
+            if _has_material(h_lo - 0.3, amin + 0.3, -1):
+                return False  # material past the low end → blind
+            return True
+        except Exception:
+            return False
+
+    for h in holes:
+        h["is_through"] = _is_through_hole_topo(h)
+
+    # Filter out tube cavities: a very deep BLIND cylinder is unlikely a
+    # machined hole (typical drilled holes max ~5-6x diameter). Through holes
+    # are ALWAYS kept regardless of depth ratio — a small-diameter through hole
+    # in a thick body (e.g. M4 through a 50mm plate) is perfectly valid.
     def _is_likely_hole(h):
+        if h.get("is_through"):
+            return True
         depth = h.get("depth", 0)
         dia = h["diameter"]
         if depth <= 0 or dia <= 0:
@@ -1198,6 +1274,20 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
             # i = larger hole (potential counterbore), j = smaller hole (main bore)
             if unique_holes[i]["diameter"] <= unique_holes[j]["diameter"]:
                 continue
+            # A counterbore is a recess for a SCREW HEAD, so it is only valid
+            # for fastener-sized bores. Reject oversized stepped bores such as a
+            # Φ58 bore stepping up to Φ68 — that is a bearing/seal seat, not a
+            # screw counterbore (no screw is that large). Two tests:
+            #   1. main bore must be within screw clearance range (≤ ~M24)
+            #   2. counterbore/main diameter ratio must match a screw head
+            #      (socket-head counterbores are ~1.5–1.8×; allow 1.3–2.5)
+            main_dia = unique_holes[j]["diameter"]
+            cb_dia = unique_holes[i]["diameter"]
+            if main_dia > 26.0:
+                continue
+            cb_ratio = cb_dia / main_dia if main_dia > 0 else 999.0
+            if cb_ratio < 1.3 or cb_ratio > 2.5:
+                continue
             ac1 = unique_holes[i].get("axis_center", unique_holes[i]["center"])
             ac2 = unique_holes[j].get("axis_center", unique_holes[j]["center"])
             axis_i = unique_holes[i]["axis"]
@@ -1229,51 +1319,6 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
             unique_holes[i]["is_counterbore_of"] = j
             break
 
-    # Determine through-hole by checking if both ends of the cylinder are open
-    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
-    from OCP.gp import gp_Pnt
-    from OCP.TopAbs import TopAbs_ON, TopAbs_OUT, TopAbs_IN
-    _solid_shape = result.val().wrapped
-
-    def _is_through_hole_topo(hole_data, all_faces):
-        """Check if a cylindrical hole is through by examining if bot_pt is on or outside the solid surface.
-        
-        Uses BRepClass3d_SolidClassifier to test if the bottom point of the hole
-        exits the solid body. If it does, the hole is through.
-        """
-        axis = hole_data["axis"]
-        top = hole_data.get("top_pt", hole_data["center"])
-        bot = hole_data.get("bot_pt", hole_data["center"])
-        depth = hole_data.get("depth", 0)
-        if depth < 0.5:
-            return False
-
-        try:
-            ax = (axis[0], axis[1], axis[2])
-            # Test a point slightly beyond bot_pt along the axis
-            test_pt = gp_Pnt(
-                bot[0] - ax[0] * 0.1,
-                bot[1] - ax[1] * 0.1,
-                bot[2] - ax[2] * 0.1,
-            )
-            classifier = BRepClass3d_SolidClassifier(_solid_shape, test_pt, 0.01)
-            state = classifier.State()
-            if state == TopAbs_ON or state == TopAbs_OUT:
-                return True
-            # Also test in the opposite direction from top_pt
-            test_pt2 = gp_Pnt(
-                top[0] + ax[0] * 0.1,
-                top[1] + ax[1] * 0.1,
-                top[2] + ax[2] * 0.1,
-            )
-            classifier2 = BRepClass3d_SolidClassifier(_solid_shape, test_pt2, 0.01)
-            state2 = classifier2.State()
-            if state2 == TopAbs_ON or state2 == TopAbs_OUT:
-                return True
-            return False
-        except Exception:
-            return False
-
     # Classify
     annotations = []
     for i, hole in enumerate(unique_holes):
@@ -1286,8 +1331,8 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
                 counterbore = other
                 break
         depth = hole.get("depth", 0)
-        # Through-hole: check if hole spans the full body in its axis direction
-        is_through = _is_through_hole_topo(hole, faces)
+        # Through-hole status was computed up-front (both ends open to outside)
+        is_through = hole.get("is_through", False)
 
         thread_spec = None
         for tap_d, spec in TAP_DRILL_TO_THREAD.items():

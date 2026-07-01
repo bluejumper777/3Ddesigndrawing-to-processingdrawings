@@ -1,20 +1,14 @@
-# Virtual environment
-.venv/
+﻿# Bundled Python runtime (huge, machine-specific)
+python/
+# Generated artifacts (STEP/STL/HTML output)
+output/
+# Python bytecode
 __pycache__/
 *.pyc
-
-# Generated output
-output/
-
-# Build/dist
-dist/
-build/
-
-# Test files
-test_*.py
-*_out.txt
-stage_dbg.txt
-
-# OS
-Thumbs.db
-.DS_Store
+# Local working backups
+*.bak_*
+# CAD / mesh artifacts
+*.stl
+*.step
+*.STEP
+*.stp

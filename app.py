@@ -34,7 +34,7 @@ from annotator import (
     load_assembly_with_meshes,
 )
 
-app = FastAPI(title="Hole Annotator Tool", version="5.0.0")
+app = FastAPI(title="Hole Annotator Tool", version="5.1.0")
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -107,12 +107,14 @@ async def upload_step(file: UploadFile = File(...)):
     parts = split_assembly(str(step_path), str(session_dir))
 
     if not parts:
-        # Single part — treat as a one-node tree (same flow as assembly)
+        # Single part — treat as a one-node tree (same flow as assembly).
+        # Mark it so confirm analyzes the WHOLE file directly (no name matching).
         parts = [{
             "name": project_name,
             "type": "part",
             "pd_id": 0,
             "solid_indices": [],
+            "is_whole_file": True,
         }]
 
     # Assembly or single part — return tree structure
@@ -223,9 +225,17 @@ async def confirm_and_annotate(session_id: str = Form(...),
             else:
                 all_indices = node.get("solid_indices", [])
 
+            # Single-part file: analyze the whole STEP directly (no name matching)
+            if node.get("is_whole_file"):
+                from annotator import analyze_step_and_generate_viewer
+                part_session = f"{session_id}_{name[:8]}"
+                result = analyze_step_and_generate_viewer(
+                    step_path, part_session, output_dir
+                )
+                result["part_name"] = name
             # If no solid_indices available (common when XDE mapping fails),
             # fall back to exporting by name matching via XDE
-            if not all_indices:
+            elif not all_indices:
                 # Use the full STEP file and let export handle by name
                 part_session = f"{session_id}_{name[:8]}"
                 result = _export_part_by_name(
@@ -423,7 +433,7 @@ def _build_page_html() -> str:
 
 def main():
     port = 8080
-    print(f"\n  3D 孔标注工具 v5.0")
+    print(f"\n  3D 孔标注工具 v5.1")
     print(f"  浏览器访问: http://127.0.0.1:{port}")
     print(f"  项目会自动保存，关闭后重新打开无需重新上传\n")
 
