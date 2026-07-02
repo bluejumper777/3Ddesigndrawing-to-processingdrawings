@@ -21,6 +21,126 @@ TAP_DRILL_TO_THREAD: dict[float, str] = {
 }
 PIN_HOLE_DIAMETERS = {3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0}
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# XDE document cache
+# ═══════════════════════════════════════════════════════════════════════════════
+# Parsing a large STEP assembly via XDE is expensive. When annotating a whole
+# assembly, _export_part_by_name is called once PER PART — without caching this
+# re-parses the entire file N times (N = part count), taking many minutes and
+# leaking memory, which drops the /confirm HTTP connection ("Failed to fetch").
+# We keep the most recently loaded document so all parts of one assembly reuse a
+# single parse. Only one entry is retained to bound memory.
+_XDE_CACHE: dict = {}
+
+
+def _load_xde_doc(step_file_path: str):
+    """Load a STEP file via XDE, reusing the cached document when unchanged.
+
+    Returns (doc, shape_tool) or raises on failure. Cached by resolved path +
+    mtime; only the most recent file is kept to keep memory bounded.
+    """
+    from OCP.XCAFDoc import XCAFDoc_DocumentTool
+    from OCP.TDocStd import TDocStd_Document
+    from OCP.STEPCAFControl import STEPCAFControl_Reader
+    from OCP.TCollection import TCollection_ExtendedString
+
+    p = Path(step_file_path)
+    key = str(p.resolve())
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    cached = _XDE_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1], cached[2]
+
+    doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
+    reader = STEPCAFControl_Reader()
+    reader.SetNameMode(True)
+    reader.ReadFile(str(p))
+    reader.Transfer(doc)
+    shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+
+    # Retain only the most recent document to bound memory usage.
+    _XDE_CACHE.clear()
+    _XDE_CACHE[key] = (mtime, doc, shape_tool)
+    return doc, shape_tool
+
+
+_CQ_CACHE: dict = {}
+
+
+def _load_cq_solidmap(step_file_path: str):
+    """Import a STEP via CadQuery and build a solid map, cached per file.
+
+    Like _load_xde_doc, this avoids re-importing the full assembly once per
+    part when annotating by solid index. Returns (cq_result, solid_map).
+    """
+    import cadquery as cq
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+    from OCP.TopExp import TopExp
+
+    p = Path(step_file_path)
+    key = str(p.resolve())
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = None
+
+    cached = _CQ_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1], cached[2]
+
+    result = cq.importers.importStep(str(p))
+    solid_map = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(result.val().wrapped, TopAbs_SOLID, solid_map)
+
+    _CQ_CACHE.clear()
+    _CQ_CACHE[key] = (mtime, result, solid_map)
+    return result, solid_map
+
+
+def _shells_to_solids(shapes):
+    """Sew shell/surface shapes into closed solids.
+
+    Some parts are stored in STEP as open shells (TopAbs_SHELL) rather than
+    solids — they render fine but expose no TopAbs_SOLID, so index/solid-based
+    extraction finds nothing. Sewing the faces and making solids lets these
+    parts still be hole-analyzed. Returns a list of solids (empty if none)."""
+    try:
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+        from OCP.TopAbs import TopAbs_SHELL
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+    except ImportError:
+        return []
+    sew = BRepBuilderAPI_Sewing(1e-3)
+    added = 0
+    for s in shapes:
+        if s is not None and not s.IsNull():
+            sew.Add(s)
+            added += 1
+    if not added:
+        return []
+    try:
+        sew.Perform()
+        sewed = sew.SewedShape()
+    except Exception:
+        return []
+    solids = []
+    ex = TopExp_Explorer(sewed, TopAbs_SHELL)
+    while ex.More():
+        try:
+            mk = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(ex.Current()))
+            if mk.IsDone():
+                solids.append(mk.Solid())
+        except Exception:
+            pass
+        ex.Next()
+    return solids
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Unicode \X2\ decode
@@ -627,13 +747,9 @@ def export_and_analyze_part(step_file_path: str, solid_indices: list[int], part_
         return {"error": "CadQuery not available", "total_holes": 0, "html_path": None}
 
     try:
-        result = cq.importers.importStep(str(step_file_path))
+        result, solid_map = _load_cq_solidmap(str(step_file_path))
     except Exception as exc:
         return {"error": f"Failed to load STEP: {exc}", "total_holes": 0, "html_path": None}
-
-    shape = result.val().wrapped
-    solid_map = TopTools_IndexedMapOfShape()
-    TopExp.MapShapes_s(shape, TopAbs_SOLID, solid_map)
 
     builder = BRep_Builder()
     compound = TopoDS_Compound()
@@ -764,14 +880,10 @@ def _export_part_by_name(step_file_path: str, part_name: str, is_weldment: bool,
 
     step_path = Path(step_file_path)
 
-    # Load via XDE
+    # Load via XDE (cached — the whole assembly is parsed once and reused across
+    # all parts, instead of re-parsing the full file for every part).
     try:
-        doc = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
-        reader = STEPCAFControl_Reader()
-        reader.SetNameMode(True)
-        reader.ReadFile(str(step_path))
-        reader.Transfer(doc)
-        shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+        doc, shape_tool = _load_xde_doc(str(step_path))
     except Exception as e:
         return {"error": f"XDE load failed: {e}", "total_holes": 0, "html_path": None}
 
@@ -842,6 +954,7 @@ def _export_part_by_name(step_file_path: str, part_name: str, is_weldment: bool,
         return False
 
     found_shapes = []
+    found_raw = []  # non-solid shapes (shells/surfaces) for sew-to-solid fallback
     _match_found = [False]  # Use list to allow mutation in nested function
 
     def _extract_solids_from_label(label):
@@ -856,6 +969,9 @@ def _export_part_by_name(step_file_path: str, part_name: str, is_weldment: bool,
         _TE.MapShapes_s(shape, _TA_SOLID, sub_map)
         for k in range(1, sub_map.Extent() + 1):
             found_shapes.append(sub_map.FindKey(k))
+        if sub_map.Extent() == 0:
+            # No solids — keep the raw shape (likely a shell) for a sew fallback.
+            found_raw.append(shape)
 
     def search_labels(label, target_name):
         """Search for label matching target_name. Stops after first match."""
@@ -913,14 +1029,26 @@ def _export_part_by_name(step_file_path: str, part_name: str, is_weldment: bool,
         search_labels(free_labels.Value(i), part_name)
 
     if not found_shapes:
-        # DO NOT fallback to analyzing the entire STEP file.
-        # Return a clear error instead of silently giving wrong results.
-        return {
-            "error": f"未能在STEP文件中匹配到零件 '{part_name}'。XDE标签名可能与显示名不一致。",
-            "total_holes": 0,
-            "html_path": None,
-            "part_name": part_name,
-        }
+        # No solids found. If the matched part is a shell/surface body (renders
+        # fine but has no TopAbs_SOLID), try sewing it into a solid so its holes
+        # can still be analyzed. Only error out if that also fails.
+        if found_raw:
+            sewn = _shells_to_solids(found_raw)
+            if sewn:
+                found_shapes = sewn
+        if not found_shapes:
+            if _match_found[0]:
+                msg = (f"零件 '{part_name}' 没有可用的实体几何（曲面/片体且无法缝合成实体），"
+                       f"无法识别孔。")
+            else:
+                msg = (f"未能在STEP文件中匹配到零件 '{part_name}'。"
+                       f"XDE标签名可能与显示名不一致。")
+            return {
+                "error": msg,
+                "total_holes": 0,
+                "html_path": None,
+                "part_name": part_name,
+            }
 
     # Deduplicate shapes (same shape may be found via multiple paths)
     unique_shapes = []
@@ -993,6 +1121,10 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
 
     raw_cyls = []
     _hole_solid_shape = result.val().wrapped  # for inner/outer containment test
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier as _SC
+    from OCP.TopAbs import TopAbs_IN as _IN
+    from OCP.gp import gp_Pnt as _gp_Pnt
+    _face_clf = _SC(_hole_solid_shape)  # reused across all faces (load shape once)
     for face in result.faces().vals():
         if face.geomType() != "CYLINDER":
             continue
@@ -1013,9 +1145,6 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
         # HOLE: that point enters the void → OUTSIDE solid.
         # BOSS/PIN: that point enters material → INSIDE solid.
         try:
-            from OCP.BRepClass3d import BRepClass3d_SolidClassifier as _SC
-            from OCP.TopAbs import TopAbs_IN as _IN
-            from OCP.gp import gp_Pnt as _gp_Pnt
             um = (u_min + u_max) / 2
             vm = (adaptor.FirstVParameter() + adaptor.LastVParameter()) / 2
             sp = adaptor.Value(um, vm)  # point on cylinder surface
@@ -1033,8 +1162,8 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
                     sp.Y() + toward[1]/tlen*step,
                     sp.Z() + toward[2]/tlen*step,
                 )
-                clf = _SC(_hole_solid_shape, tp, 1e-4)
-                if clf.State() == _IN:
+                _face_clf.Perform(tp, 1e-4)
+                if _face_clf.State() == _IN:
                     continue  # toward-axis is inside material → external cylinder
         except Exception:
             pass  # keep the face if check fails (conservative)
@@ -1151,40 +1280,39 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
     holes = [c for c in cylinders if c["diameter"] < max_body_dim * 0.9]
 
     # === Through-hole detection (topology-based) ===
-    # A hole is "through" only when the hole's centerline stays in open space
-    # (void) for the entire span of the body along the hole axis. If solid
-    # material is found anywhere along the interior of that centerline, the
-    # hole is blind. Marching the full centerline is robust to drill-tip cones
-    # and stepped/counterbored bores, unlike a tiny nudge past the face end.
+    # A hole is "through" when neither end is blocked by material. We sample the
+    # centerline only a SHORT distance beyond each end of the hole (enough to
+    # clear a drill-tip cone and detect a blind bottom). This is bounded so a
+    # small hole inside a large weldment does not scan across the whole assembly
+    # bbox (which caused analysis to hang for minutes on big merged parts).
     from OCP.BRepClass3d import BRepClass3d_SolidClassifier
     from OCP.gp import gp_Pnt
     from OCP.TopAbs import TopAbs_ON, TopAbs_OUT, TopAbs_IN
     _solid_shape = result.val().wrapped
-    _bb = result.val().BoundingBox()
-    _corners = [
-        (_bb.xmin, _bb.ymin, _bb.zmin), (_bb.xmin, _bb.ymin, _bb.zmax),
-        (_bb.xmin, _bb.ymax, _bb.zmin), (_bb.xmin, _bb.ymax, _bb.zmax),
-        (_bb.xmax, _bb.ymin, _bb.zmin), (_bb.xmax, _bb.ymin, _bb.zmax),
-        (_bb.xmax, _bb.ymax, _bb.zmin), (_bb.xmax, _bb.ymax, _bb.zmax),
-    ]
+    # Build ONE reusable solid classifier: constructing with a point reloads the
+    # whole shape every call, which is crippling for large weldments. Loading the
+    # shape once and calling Perform() per query point is dramatically faster.
+    _clf = BRepClass3d_SolidClassifier(_solid_shape)
+
+    def _point_state(x, y, z):
+        _clf.Perform(gp_Pnt(x, y, z), 1e-4)
+        return _clf.State()
 
     def _is_through_hole_topo(hole_data):
-        """True only if no solid material blocks the bore beyond its ends.
+        """True only if neither end of the bore is blocked by nearby material.
 
-        The hole's own cylindrical span is void by definition, so it is skipped
-        entirely. Only the centerline OUTSIDE the hole's axial extent is sampled
-        (out to the body bounds). For a through hole both ends sit on outer
-        surfaces, so the outward regions are exterior and no material is found.
-        For a blind hole the closed end is inside the body, so material is hit
-        almost immediately (early exit). This keeps the query count proportional
-        to the small gap between the hole ends and the body surface, instead of
-        the full body length — much faster, especially for long through holes.
+        Samples the centerline a bounded distance beyond each hole end. If solid
+        material is found just past an end (a blind bottom / drill cone), the
+        hole is blind; if both ends open into free space, it is through. The
+        bounded reach keeps the query count small and independent of the overall
+        part size — essential for large weldments with many holes.
         """
         axis = hole_data["axis"]
         ac = hole_data.get("axis_center", hole_data["center"])
         top = hole_data.get("top_pt", hole_data["center"])
         bot = hole_data.get("bot_pt", hole_data["center"])
         depth = hole_data.get("depth", 0)
+        dia = hole_data.get("diameter", 0)
         if depth < 0.5:
             return False
         try:
@@ -1193,29 +1321,25 @@ def analyze_step_and_generate_viewer(step_file_path: str, session_id: str, outpu
             def _proj(p):
                 return (p[0] - ac[0]) * ax[0] + (p[1] - ac[1]) * ax[1] + (p[2] - ac[2]) * ax[2]
 
-            corner_projs = [_proj(c) for c in _corners]
-            amin, amax = min(corner_projs), max(corner_projs)
             h_lo = min(_proj(top), _proj(bot))
             h_hi = max(_proj(top), _proj(bot))
+            # Look just past each end: enough to clear a drill cone / hit a blind
+            # bottom, capped so large parts stay fast.
+            reach = min(max(2.0 * dia, 8.0), 60.0)
             step = 0.5
 
-            def _has_material(t_start, t_end, direction):
-                """Scan (t_start → t_end) along the axis; True if any point is IN solid."""
-                t = t_start
-                while (direction > 0 and t < t_end) or (direction < 0 and t > t_end):
-                    px = ac[0] + ax[0] * t
-                    py = ac[1] + ax[1] * t
-                    pz = ac[2] + ax[2] * t
-                    st = BRepClass3d_SolidClassifier(_solid_shape, gp_Pnt(px, py, pz), 1e-4).State()
-                    if st == TopAbs_IN:
+            def _material_beyond(start, direction):
+                d = 0.3  # skip the surface/opening itself
+                while d <= reach:
+                    t = start + direction * d
+                    if _point_state(ac[0] + ax[0] * t, ac[1] + ax[1] * t, ac[2] + ax[2] * t) == TopAbs_IN:
                         return True
-                    t += direction * step
+                    d += step
                 return False
 
-            # Only sample the two regions beyond the hole ends, up to body bounds.
-            if _has_material(h_hi + 0.3, amax - 0.3, +1):
+            if _material_beyond(h_hi, +1):
                 return False  # material past the high end → blind
-            if _has_material(h_lo - 0.3, amin + 0.3, -1):
+            if _material_beyond(h_lo, -1):
                 return False  # material past the low end → blind
             return True
         except Exception:
